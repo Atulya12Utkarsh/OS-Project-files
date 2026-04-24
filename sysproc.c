@@ -110,8 +110,9 @@ sys_uptime(void)
 uint64
 sys_waitx(void)
 {
-  uint64 wtime_addr, rtime_addr;
+  uint64 wtime_addr, rtime_addr,nswtch_addr;
   argaddr(0,&wtime_addr);
   argaddr(1,&rtime_addr);
-  return waitx(wtime_addr,rtime_addr);
+  argaddr(2,&nswtch_addr);
+  return waitx(wtime_addr,rtime_addr,nswtch_addr);
 }

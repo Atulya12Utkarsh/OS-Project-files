@@ -104,7 +104,37 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  uint ctime;
-  uint rtime;
-  uint etime;
+  uint ctime;                  // Creation time (ticks)
+  uint rtime;                  // Total CPU run time (ticks)
+  uint etime;                  // Exit time (ticks)
+
+  // ---- Scheduling metadata (added for parallel scheduling project) ----
+
+  // LPT (Longest Processing Time) field:
+  // Stores an estimate of how long this process needs to run, in ticks.
+  // Lower value = short job = higher scheduling urgency (SJF principle).
+  // Set at process creation; can be updated via a syscall if needed.
+  // Default: PRIORITY_DEFAULT (medium urgency).
+  int estimated_runtime;
+
+  // Adaptive Scheduler fields:
+  // priority = current effective scheduling priority.
+  //   - Range: [PRIORITY_MIN .. PRIORITY_MAX]
+  //   - Lower value = higher urgency = gets CPU sooner.
+  //   - Starts equal to estimated_runtime.
+  //   - Decreases over time via aging so no process starves.
+  int priority;
+
+  // age_start = the tick value when this process last became RUNNABLE.
+  // Used by the scheduler to compute how long the process has been waiting.
+  // Wait time = ticks - age_start.
+  // Reset every time state transitions to RUNNABLE (yield, wakeup, fork).
+  uint64 age_start;
+
+  // Work-Stealing field:
+  // Preferred CPU id for this process (-1 = no preference).
+  // The work-stealing algorithm tries to schedule this process on
+  // affinity_cpu first; steals to another CPU only when that one is idle.
+  int affinity_cpu;
+  uint nswtch;
 };

@@ -6,8 +6,12 @@
 #include "proc.h"
 #include "defs.h"
 
-struct cpu cpus[NCPU];
+int select_victim(int id);
+void push_back(struct cpu *c, struct proc *p);
+struct proc* pop_front(struct cpu *c);
+struct proc* pop_back(struct cpu *c);
 
+struct cpu cpus[NCPU];
 struct proc proc[NPROC];
 
 struct proc *initproc;
@@ -19,7 +23,7 @@ extern void forkret(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
-
+static uint rand_seed=3791412;
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -55,6 +59,12 @@ procinit(void)
       initlock(&p->lock, "proc");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
+  }
+
+  for(int i = 0; i < NCPU; i++){
+      initlock(&cpus[i].lock, "cpu_queue");
+      cpus[i].front = 0;
+      cpus[i].rear = 0;
   }
 }
 
@@ -124,11 +134,13 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->last_cpu=-1;
   acquire(&tickslock);
   p->ctime=ticks;
   release(&tickslock);
   p->rtime=0;
   p->etime=0;
+  p->nswtch=0;
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -231,7 +243,8 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  if(p->state == RUNNABLE)
+    push_back(&cpus[cpuid()], p);
   release(&p->lock);
 }
 
@@ -304,6 +317,8 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  if(np->state == RUNNABLE)
+    push_back(&cpus[cpuid()], np);
   release(&np->lock);
 
   return pid;
@@ -420,6 +435,76 @@ kwait(uint64 addr)
   }
 }
 
+
+// ================= WORK STEALING HELPERS =================
+
+uint rand()
+{
+	rand_seed=rand_seed*1103515245+12345;
+	return rand_seed;
+}
+
+int select_victim(int id)
+{
+    int victim;
+
+    do {
+        victim = rand() % NCPU;
+    } while(victim == id);
+
+    return victim;
+}
+
+
+void push_back(struct cpu *c, struct proc *p)
+{
+    acquire(&c->lock);
+
+    int next = (c->rear + 1) % MAX_TASKS;
+    if(next == c->front){
+        release(&c->lock);   // queue full
+        return;
+    }
+
+    c->queue[c->rear] = p;
+    c->rear = next;
+
+    release(&c->lock);
+}
+
+struct proc* pop_front(struct cpu *c)
+{
+    acquire(&c->lock);
+
+    if(c->front == c->rear){
+        release(&c->lock);
+        return 0;
+    }
+
+    struct proc *p = c->queue[c->front];
+    c->front = (c->front + 1) % MAX_TASKS;
+
+    release(&c->lock);
+    return p;
+}
+
+struct proc* pop_back(struct cpu *c)
+{
+    acquire(&c->lock);
+
+    if(c->front == c->rear){
+        release(&c->lock);
+        return 0;
+    }
+
+    c->rear = (c->rear - 1 + MAX_TASKS) % MAX_TASKS;
+    struct proc *p = c->queue[c->rear];
+
+    release(&c->lock);
+    return p;
+}
+
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -427,46 +512,84 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
-void
-scheduler(void)
+void scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-
   c->proc = 0;
+
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
-    intr_off();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    int id = cpuid();
+    struct proc *temp;
+    p = 0;
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    // Try local queue first
+    int count=0;
+    while(count<MAX_TASKS)
+    {
+      count++;
+      temp=pop_back(c);
+      if(temp==0) break;
+      acquire(&temp->lock);
+      if(temp->state==RUNNABLE)
+      {
+        p=temp;
+        break;
+      }
+      release(&temp->lock);
+    }
+
+    // Work stealing if local queue empty
+    if(p==0)
+    {
+      int attempts=0;
+      while(p==0 && attempts<NCPU-1)
+      {
+        attempts++;
+        int victim=select_victim(id);
+        int count2=0;
+        while(count2<MAX_TASKS)
+        {
+          count2++;
+          temp=pop_front(&cpus[victim]);
+          if(temp==0) break;
+          acquire(&temp->lock);
+          if(temp->state==RUNNABLE)
+          {
+            p=temp;
+            break;
+          }
+          release(&temp->lock);
+        }
+      }
+    }
+
+    // Run the process if found
+    if(p)
+    {
+      p->state=RUNNING;
+      c->proc=p;
+      p->last_cpu=cpuid();
+      swtch(&c->context,&p->context);
+      c->proc=0;
+
+      if(p->state==RUNNABLE)
+      {
+        push_back(&cpus[cpuid()],p);
       }
       release(&p->lock);
-    }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    } 
+    else 
+    {
       asm volatile("wfi");
     }
-  }
+
+  } // <-- closes for(;;)
 }
+
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
@@ -491,6 +614,7 @@ sched(void)
     panic("sched interruptible");
 
   intena = mycpu()->intena;
+  p->nswtch++;
   swtch(&p->context, &mycpu()->context);
   mycpu()->intena = intena;
 }
@@ -502,6 +626,8 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  if(p->state == RUNNABLE)
+    push_back(&cpus[cpuid()], p);
   sched();
   release(&p->lock);
 }
@@ -586,6 +712,9 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+ 
+        if(p->state == RUNNABLE)
+	      push_back(&cpus[cpuid()], p);
       }
       release(&p->lock);
     }
@@ -607,6 +736,9 @@ kkill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+	
+  if(p->state == RUNNABLE)
+	  push_back(&cpus[cpuid()], p);
       }
       release(&p->lock);
       return 0;
@@ -709,7 +841,7 @@ void update_process_times() {
 
 // --- CUSTOM METRIC: WAITX SYSTEM CALL ---
 // Functions exactly like wait(), but calculates and returns our metrics
-int waitx(uint64 addr_wtime, uint64 addr_rtime) {
+int waitx(uint64 addr_wtime, uint64 addr_rtime, uint64 addr_nswtch) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -731,7 +863,7 @@ int waitx(uint64 addr_wtime, uint64 addr_rtime) {
           int turnaround_time = np->etime - np->ctime;
           int run_time = np->rtime;
           int wait_time = turnaround_time - run_time;
-
+          int num_switches = np->nswtch;
           // Copy the metrics back to user-space pointers
           if(addr_wtime != 0){
             copyout(p->pagetable, addr_wtime, (char *)&wait_time, sizeof(wait_time));
@@ -739,7 +871,9 @@ int waitx(uint64 addr_wtime, uint64 addr_rtime) {
           if(addr_rtime != 0){
             copyout(p->pagetable, addr_rtime, (char *)&run_time, sizeof(run_time));
           }
-
+          if(addr_nswtch != 0){
+            copyout(p->pagetable, addr_nswtch, (char *)&num_switches, sizeof(num_switches));
+          }
           freeproc(np);
           release(&np->lock);
           release(&wait_lock);

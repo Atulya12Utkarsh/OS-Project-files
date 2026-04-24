@@ -40,10 +40,10 @@ int main(void) {
     int pid, i, is_monster;
     
     // ---> NEW VARIABLES FOR METRICS <---
-    int wtime, rtime;
+    int wtime, rtime,nswtch;
     int total_wtime = 0;
     int total_rtime = 0;
-    
+    int total_nswtch=0;
     start_time = uptime();
     
     printf("--- Starting Bimodal Workload Test ---\n");
@@ -84,9 +84,10 @@ int main(void) {
     // ---> NEW WAIT LOOP <---
     // Wait for all 50 tasks using our custom waitx system call!
     for (i = 0; i < 50; i++) {
-        waitx(&wtime, &rtime); 
+        waitx(&wtime, &rtime,&nswtch); 
         total_wtime += wtime;
         total_rtime += rtime;
+        total_nswtch+=nswtch;
     }
 
     end_time = uptime();
@@ -99,6 +100,6 @@ int main(void) {
     // ---> PRINT THE NEW METRICS <---
     printf("Total Wait Time: %d ticks\n", total_wtime);
     printf("Total CPU Utilization: %d ticks\n", total_rtime);
-
+    printf("Total Context switches: %d \n", total_nswtch);
     exit(0);
 }
